@@ -1,0 +1,62 @@
+# Environment and secrets
+.env
+.env.*
+.env.local
+.env.production
+.env.development
+
+# API keys and tokens
+*.pem
+*.key
+*.cert
+*.p12
+*.pfx
+apikey.txt
+*_tokens.json
+*_credentials.json
+credentials.json
+service-account*.json
+secrets.yaml
+secrets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+desktop.ini
+
+# Local Claude settings
+.claude/
+claude.md
+
+# Legacy scripts with local-only usage
+SamplePython.py
+calibrate.py
+capture_reference.py
+
+# Captured images and calibration data (large, local-only)
+images/
+calibration_images/
+calibration_capture.jpg
+calibration_log.csv
+test_harness_results.csv
+failure/
