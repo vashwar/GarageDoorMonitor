@@ -4,6 +4,15 @@ import os
 import sys
 from dotenv import load_dotenv
 from skimage.metrics import structural_similarity as ssim
+from garage_monitor import (
+    crop_to_roi,
+    detect_camera_mode,
+    compute_roi_features,
+    LAPLACIAN_THRESHOLD,
+    BRIGHTNESS_IR_OPEN_MAX,
+    BRIGHTNESS_DAY_OPEN_MIN,
+    ROI_STD_THRESHOLD,
+)
 
 # =============================================================================
 # Configuration (loaded from .env)
@@ -39,6 +48,7 @@ def main():
     ref_names = list(refs.keys())
     print(f"Loaded {len(refs)} reference images: {ref_names}")
     print(f"SSIM threshold: {SSIM_THRESHOLD}")
+    print(f"Laplacian threshold: {LAPLACIAN_THRESHOLD}")
 
     # Read calibration log
     if not os.path.exists(CALIBRATION_LOG):
@@ -62,6 +72,15 @@ def main():
         ] + [f"ssim_{name}" for name in ref_names] + [
             "best_ssim",
             "best_ref",
+            "ssim_vote",
+            "laplacian_var",
+            "lap_vote",
+            "roi_brightness",
+            "bright_vote",
+            "camera_mode",
+            "open_votes",
+            "roi_std",
+            "roi_std_override",
             "new_status",
             "match",
         ]
@@ -82,18 +101,18 @@ def main():
                 continue
 
             frame = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            color_frame = cv2.imread(image_path, cv2.IMREAD_COLOR)
             if frame is None:
                 print(f"  Skipping {image_file} (could not read)")
                 skipped += 1
                 continue
 
-            # Compute SSIM against each reference
+            # Signal 1: SSIM against each reference
             scores = {}
             for name, ref in refs.items():
                 f_resized = frame
                 if f_resized.shape != ref.shape:
                     f_resized = cv2.resize(f_resized, (ref.shape[1], ref.shape[0]))
-                # Gaussian blur to match garage_monitor.py pipeline
                 f_blur = cv2.GaussianBlur(f_resized, (7, 7), 0)
                 ref_blur = cv2.GaussianBlur(ref, (7, 7), 0)
                 score, _ = ssim(ref_blur, f_blur, full=True)
@@ -101,7 +120,29 @@ def main():
 
             best_ref = max(scores, key=scores.get)
             best_ssim = scores[best_ref]
-            new_status = "OPEN" if best_ssim < SSIM_THRESHOLD else "CLOSED"
+            ssim_vote = "OPEN" if best_ssim < SSIM_THRESHOLD else "CLOSED"
+
+            # Signal 2: Laplacian variance
+            laplacian_var, mean_brightness, roi_std = compute_roi_features(frame)
+            lap_vote = "OPEN" if laplacian_var > LAPLACIAN_THRESHOLD else "CLOSED"
+
+            # Signal 3: ROI brightness
+            camera_mode = detect_camera_mode(color_frame) if color_frame is not None else "daylight"
+            if camera_mode == "ir":
+                bright_vote = "OPEN" if mean_brightness < BRIGHTNESS_IR_OPEN_MAX else "CLOSED"
+            else:
+                bright_vote = "OPEN" if mean_brightness > BRIGHTNESS_DAY_OPEN_MIN else "CLOSED"
+
+            # 2-of-3 voting
+            open_votes = sum(1 for v in [ssim_vote, lap_vote, bright_vote] if v == "OPEN")
+            new_status = "OPEN" if open_votes >= 2 else "CLOSED"
+
+            # Override: SSIM OPEN + low ROI std dev → night open door
+            roi_std_override = False
+            if ssim_vote == "OPEN" and roi_std < ROI_STD_THRESHOLD:
+                new_status = "OPEN"
+                roi_std_override = True
+
             original_status = row["door_status"]
             matched = "YES" if new_status == original_status else "NO"
 
@@ -120,15 +161,28 @@ def main():
                 out_row[f"ssim_{name}"] = f"{scores[name]:.4f}"
             out_row["best_ssim"] = f"{best_ssim:.4f}"
             out_row["best_ref"] = best_ref
+            out_row["ssim_vote"] = ssim_vote
+            out_row["laplacian_var"] = f"{laplacian_var:.1f}"
+            out_row["lap_vote"] = lap_vote
+            out_row["roi_brightness"] = f"{mean_brightness:.1f}"
+            out_row["bright_vote"] = bright_vote
+            out_row["camera_mode"] = camera_mode
+            out_row["open_votes"] = f"{open_votes}/3"
+            out_row["roi_std"] = f"{roi_std:.1f}"
+            out_row["roi_std_override"] = "YES" if roi_std_override else ""
             out_row["new_status"] = new_status
             out_row["match"] = matched
 
             writer.writerow(out_row)
 
+            override_tag = " [STD_OVERRIDE]" if roi_std_override else ""
             print(
                 f"  [{i+1}/{len(rows)}] {image_file}  |  "
-                f"Best: {best_ssim:.4f} ({best_ref})  |  "
-                f"{original_status} -> {new_status}  {matched}"
+                f"SSIM:{best_ssim:.4f}({ssim_vote}) "
+                f"Lap:{laplacian_var:.0f}({lap_vote}) "
+                f"Brt:{mean_brightness:.0f}({bright_vote},{camera_mode}) "
+                f"Std:{roi_std:.1f}  |  "
+                f"{original_status} -> {new_status}  {matched}{override_tag}"
             )
 
     # Summary

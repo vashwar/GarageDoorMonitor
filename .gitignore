@@ -59,4 +59,5 @@ calibration_images/
 calibration_capture.jpg
 calibration_log.csv
 test_harness_results.csv
+validate_detection_results.csv
 failure/

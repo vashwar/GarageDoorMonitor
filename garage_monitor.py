@@ -33,6 +33,18 @@ WARMUP_FRAMES = 10
 IMAGES_DIR = "images"
 MAX_IMAGES = 30
 
+# ROI (Region of Interest) — door-panel gap between cars on 2304x1296 frame
+ROI_X1, ROI_Y1, ROI_X2, ROI_Y2 = 900, 100, 1400, 700
+FRAME_W, FRAME_H = 2304, 1296
+
+# Multi-signal detection thresholds
+LAPLACIAN_THRESHOLD = float(os.getenv("LAPLACIAN_THRESHOLD", "700"))
+BRIGHTNESS_IR_OPEN_MAX = float(os.getenv("BRIGHTNESS_IR_OPEN_MAX", "85"))
+BRIGHTNESS_DAY_OPEN_MIN = float(os.getenv("BRIGHTNESS_DAY_OPEN_MIN", "165"))
+IR_SATURATION_THRESHOLD = 20.0
+CONSECUTIVE_OPEN_REQUIRED = int(os.getenv("CONSECUTIVE_OPEN_REQUIRED", "2"))
+ROI_STD_THRESHOLD = float(os.getenv("ROI_STD_THRESHOLD", "55"))
+
 
 # =============================================================================
 # Core Functions
@@ -104,20 +116,91 @@ def compute_ssim(frame, reference):
     return score
 
 
-def check_door(gray_frame, references):
+def crop_to_roi(gray_frame):
+    """Crop the grayscale frame to the door-panel ROI, resizing to standard size first."""
+    h, w = gray_frame.shape[:2]
+    if w != FRAME_W or h != FRAME_H:
+        scale_x = w / FRAME_W
+        scale_y = h / FRAME_H
+        x1 = int(ROI_X1 * scale_x)
+        y1 = int(ROI_Y1 * scale_y)
+        x2 = int(ROI_X2 * scale_x)
+        y2 = int(ROI_Y2 * scale_y)
+    else:
+        x1, y1, x2, y2 = ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
+    return gray_frame[y1:y2, x1:x2]
+
+
+def detect_camera_mode(color_frame):
+    """Detect IR/night vs daylight mode based on mean color saturation."""
+    hsv = cv2.cvtColor(color_frame, cv2.COLOR_BGR2HSV)
+    mean_saturation = hsv[:, :, 1].mean()
+    return "ir" if mean_saturation < IR_SATURATION_THRESHOLD else "daylight"
+
+
+def compute_roi_features(gray_frame):
+    """Compute Laplacian variance, mean brightness, and std dev on the door ROI."""
+    roi = crop_to_roi(gray_frame)
+    laplacian_var = cv2.Laplacian(roi, cv2.CV_64F).var()
+    mean_brightness = float(roi.mean())
+    roi_std = float(roi.std())
+    return laplacian_var, mean_brightness, roi_std
+
+
+def check_door(gray_frame, references, color_frame=None):
     """
-    Compare frame against all reference images.
-    Returns (is_open, best_ssim, best_ref_name).
+    Multi-signal door detection using 2-of-3 voting.
+
+    Signal 1: SSIM against reference images (existing)
+    Signal 2: ROI Laplacian variance (texture complexity)
+    Signal 3: ROI brightness (IR reflectance / outdoor light)
+
+    Returns (is_open, best_ssim, best_ref_name, signals_detail).
+    signals_detail is a dict with all signal values for logging.
     """
+    # Signal 1: SSIM (existing logic)
     scores = {}
     for name, ref in references.items():
         scores[name] = compute_ssim(gray_frame, ref)
 
     best_ref = max(scores, key=scores.get)
     best_ssim = scores[best_ref]
-    is_open = best_ssim < SSIM_THRESHOLD
+    ssim_vote = "OPEN" if best_ssim < SSIM_THRESHOLD else "CLOSED"
 
-    return is_open, best_ssim, os.path.basename(best_ref)
+    # Signal 2: Laplacian variance on ROI
+    laplacian_var, mean_brightness, roi_std = compute_roi_features(gray_frame)
+    lap_vote = "OPEN" if laplacian_var > LAPLACIAN_THRESHOLD else "CLOSED"
+
+    # Signal 3: ROI brightness (mode-dependent)
+    camera_mode = detect_camera_mode(color_frame) if color_frame is not None else "daylight"
+    if camera_mode == "ir":
+        bright_vote = "OPEN" if mean_brightness < BRIGHTNESS_IR_OPEN_MAX else "CLOSED"
+    else:
+        bright_vote = "OPEN" if mean_brightness > BRIGHTNESS_DAY_OPEN_MIN else "CLOSED"
+
+    # 2-of-3 voting
+    open_votes = sum(1 for v in [ssim_vote, lap_vote, bright_vote] if v == "OPEN")
+    is_open = open_votes >= 2
+
+    # Override: SSIM OPEN + low ROI std dev → uniform dark void = door open at night
+    roi_std_override = False
+    if ssim_vote == "OPEN" and roi_std < ROI_STD_THRESHOLD:
+        is_open = True
+        roi_std_override = True
+
+    signals_detail = {
+        "ssim_vote": ssim_vote,
+        "laplacian_var": laplacian_var,
+        "lap_vote": lap_vote,
+        "mean_brightness": mean_brightness,
+        "bright_vote": bright_vote,
+        "camera_mode": camera_mode,
+        "open_votes": open_votes,
+        "roi_std": roi_std,
+        "roi_std_override": roi_std_override,
+    }
+
+    return is_open, best_ssim, os.path.basename(best_ref), signals_detail
 
 
 # =============================================================================
@@ -141,14 +224,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Error: Could not capture frame from camera.")
         return
 
-    is_open, best_ssim, best_ref = await asyncio.to_thread(check_door, gray_frame, references)
+    is_open, best_ssim, best_ref, signals = await asyncio.to_thread(
+        check_door, gray_frame, references, color_frame
+    )
     status = "OPEN" if is_open else "CLOSED"
 
     image_path = await asyncio.to_thread(save_image, color_frame, "status")
 
+    override_note = " [STD_OVERRIDE]" if signals.get('roi_std_override') else ""
     caption = (
-        f"Garage is {status}\n"
-        f"SSIM: {best_ssim:.4f}\n"
+        f"Garage is {status}{override_note}\n"
+        f"SSIM: {best_ssim:.4f} ({signals['ssim_vote']})\n"
+        f"LapVar: {signals['laplacian_var']:.0f} ({signals['lap_vote']})\n"
+        f"Bright: {signals['mean_brightness']:.0f} ({signals['bright_vote']}, {signals['camera_mode']})\n"
+        f"ROI Std: {signals['roi_std']:.1f}\n"
+        f"Votes: {signals['open_votes']}/3 OPEN\n"
         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -195,11 +285,14 @@ async def monitor_loop(app: Application):
 
     door_open_since = None
     alert_sent = False
+    consecutive_open_count = 0
 
     # Wait for bot to be ready
     await asyncio.sleep(2)
     print(f"Monitoring started. Checking every {MONITOR_INTERVAL // 60} minutes.")
     print(f"SSIM threshold: {SSIM_THRESHOLD}")
+    print(f"Laplacian threshold: {LAPLACIAN_THRESHOLD}")
+    print(f"Consecutive OPEN readings required: {CONSECUTIVE_OPEN_REQUIRED}")
     print(f"Alert after {OPEN_ALERT_MINUTES} minutes open.")
     print("-" * 70)
 
@@ -211,18 +304,34 @@ async def monitor_loop(app: Application):
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
 
-            is_open, best_ssim, best_ref = await asyncio.to_thread(
-                check_door, gray_frame, references
+            is_open, best_ssim, best_ref, signals = await asyncio.to_thread(
+                check_door, gray_frame, references, color_frame
             )
 
-            status = "OPEN" if is_open else "CLOSED"
             timestamp = time.strftime("%H:%M:%S")
+
+            # Temporal filtering: require consecutive OPEN readings
+            if is_open:
+                consecutive_open_count += 1
+            else:
+                consecutive_open_count = 0
+
+            # Only treat as truly open if enough consecutive readings
+            confirmed_open = consecutive_open_count >= CONSECUTIVE_OPEN_REQUIRED
+
+            status = "OPEN" if confirmed_open else "CLOSED"
+            override_tag = " [STD_OVERRIDE]" if signals.get('roi_std_override') else ""
             print(
                 f"[{timestamp}] Door: {status}  |  "
-                f"Best SSIM: {best_ssim:.4f} ({best_ref})"
+                f"SSIM: {best_ssim:.4f}({signals['ssim_vote']})  "
+                f"Lap: {signals['laplacian_var']:.0f}({signals['lap_vote']})  "
+                f"Brt: {signals['mean_brightness']:.0f}({signals['bright_vote']},{signals['camera_mode']})  "
+                f"Std: {signals['roi_std']:.1f}  "
+                f"Votes: {signals['open_votes']}/3  "
+                f"Consec: {consecutive_open_count}{override_tag}"
             )
 
-            if is_open:
+            if confirmed_open:
                 if door_open_since is None:
                     door_open_since = datetime.now()
                     alert_sent = False
@@ -230,14 +339,16 @@ async def monitor_loop(app: Application):
                 elapsed = (datetime.now() - door_open_since).total_seconds() / 60
 
                 if elapsed >= OPEN_ALERT_MINUTES and not alert_sent:
-                    # Send alert with photo
                     alert_path = await asyncio.to_thread(
                         save_image, color_frame, "alert"
                     )
                     alert_msg = (
                         f"ALERT: Garage door has been OPEN for "
                         f"{int(elapsed)} minutes!\n"
-                        f"SSIM: {best_ssim:.4f}\n"
+                        f"SSIM: {best_ssim:.4f} ({signals['ssim_vote']})\n"
+                        f"LapVar: {signals['laplacian_var']:.0f} ({signals['lap_vote']})\n"
+                        f"Bright: {signals['mean_brightness']:.0f} ({signals['bright_vote']}, {signals['camera_mode']})\n"
+                        f"Votes: {signals['open_votes']}/3 OPEN\n"
                         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
                     await send_alert(bot, alert_msg, alert_path)
@@ -245,7 +356,6 @@ async def monitor_loop(app: Application):
                     print(f"[{timestamp}] *** ALERT SENT ***")
             else:
                 if door_open_since is not None and alert_sent:
-                    # Door closed after alert — send all-clear
                     elapsed = (datetime.now() - door_open_since).total_seconds() / 60
                     clear_msg = (
                         f"Garage door is now CLOSED.\n"

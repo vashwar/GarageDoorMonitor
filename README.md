@@ -5,6 +5,7 @@ A Python-based system that watches your garage door using a TP-Link Tapo securit
 ## Key Features
 
 - **Automatic monitoring** -- continuously checks your garage door at a configurable interval (default: 30 minutes)
+- **Multi-signal detection** -- uses three independent signals (image similarity, texture complexity, brightness) with 2-of-3 voting for robust classification
 - **Multi-reference matching** -- compares against multiple reference images (two cars, one car, no cars, day/night) to handle different garage configurations
 - **Telegram alerts** -- sends a photo and message to your phone when the door is open, and an all-clear when it closes
 - **On-demand status** -- send `/status` to the Telegram bot anytime to get a live photo and door state
@@ -21,12 +22,19 @@ A Python-based system that watches your garage door using a TP-Link Tapo securit
 
 ## How It Works
 
-1. Connects to the Tapo camera's RTSP video stream
-2. Captures a single frame and converts it to grayscale
-3. Compares the frame against reference images of the closed door using SSIM (a score from 0 to 1 measuring how similar two images are)
-4. If the best SSIM score falls below the threshold (default: 0.55), the door is classified as **OPEN**
-5. If the door stays open, a Telegram alert with a photo is sent to your phone
-6. When the door closes again, an all-clear message is sent
+The monitor uses a **2-of-3 voting system** with three independent signals to decide if the door is open or closed:
+
+1. **SSIM (image similarity)** -- compares the current frame against reference images of the closed door. A low score means the image looks different from the closed state. If below the threshold (default: 0.55), votes OPEN.
+2. **Laplacian variance (texture complexity)** -- measures how much visual detail is in the door region. An open door reveals the outdoors, which has much more texture than a flat closed door. If above the threshold (default: 700), votes OPEN.
+3. **ROI brightness** -- measures how bright the door region is. Behavior depends on camera mode:
+   - **IR/night mode:** an open door appears darker (looking into darkness outside). If below threshold, votes OPEN.
+   - **Daylight mode:** an open door appears brighter (outdoor light flooding in). If above threshold, votes OPEN.
+
+If **2 or more signals** vote OPEN, the door is classified as open.
+
+**Override:** If SSIM votes OPEN and the door region has very low variation (standard deviation), the door is forced to OPEN regardless of the other signals. This catches the case of a pitch-black open door at night where Laplacian and brightness can't distinguish it.
+
+When the door is confirmed open, a Telegram alert with a photo is sent. When it closes again, an all-clear message is sent.
 
 ## Prerequisites
 
@@ -45,7 +53,7 @@ cd C:\VashwarTests\GarageCamera
 pip install opencv-python scikit-image python-telegram-bot python-dotenv
 
 # Step 3: Set up environment variables
-# Create a .env file in the project root with the following:
+# Create a .env file in the project root (see Environment Variables below)
 ```
 
 ## Environment Variables
@@ -57,10 +65,15 @@ Create a `.env` file in the project root:
 | `RTSP_URL` | Your Tapo camera's RTSP stream URL | Yes |
 | `TELEGRAM_BOT_TOKEN` | Bot token from BotFather | Yes |
 | `TELEGRAM_CHAT_IDS` | Comma-separated Telegram chat IDs to receive alerts | Yes |
+| `REFERENCE_IMAGES` | Comma-separated paths to reference images | Yes |
 | `SSIM_THRESHOLD` | Similarity threshold (0-1). Below this = door open | No (default: 0.55) |
 | `INTERVAL_MINUTES` | How often to check, in minutes | No (default: 30) |
-| `OPEN_ALERT_MINUTES` | Minutes door must stay open before alerting | No (default: 0) |
-| `REFERENCE_IMAGES` | Comma-separated paths to reference images | Yes |
+| `OPEN_ALERT_MINUTES` | Minutes door must stay open before alerting | No (default: 5) |
+| `LAPLACIAN_THRESHOLD` | Texture complexity threshold. Above this = door open | No (default: 700) |
+| `BRIGHTNESS_IR_OPEN_MAX` | IR mode brightness below this = door open | No (default: 85) |
+| `BRIGHTNESS_DAY_OPEN_MIN` | Daylight brightness above this = door open | No (default: 165) |
+| `CONSECUTIVE_OPEN_REQUIRED` | Number of consecutive OPEN readings before confirming | No (default: 2) |
+| `ROI_STD_THRESHOLD` | Low ROI standard deviation override threshold | No (default: 55) |
 
 ## How to Run
 
@@ -85,7 +98,11 @@ When you send `/status`, the bot replies with a photo and caption like this:
 
 ```
 Garage is CLOSED
-SSIM: 0.8830
+SSIM: 0.8830 (CLOSED)
+LapVar: 186 (CLOSED)
+Bright: 138 (CLOSED, ir)
+ROI Std: 41.0
+Votes: 0/3 OPEN
 Time: 2026-05-25 12:11:47
 ```
 
@@ -93,7 +110,10 @@ When the door is left open, the alert message looks like:
 
 ```
 ALERT: Garage door has been OPEN for 5 minutes!
-SSIM: 0.3784
+SSIM: 0.3784 (OPEN)
+LapVar: 1075 (OPEN)
+Bright: 180 (OPEN, daylight)
+Votes: 3/3 OPEN
 Time: 2026-05-25 17:30:58
 ```
 
@@ -113,7 +133,8 @@ Was open for 6 minutes.
 | `calibrate.py` | One-time calibration -- captures a frame and shows SSIM scores against all references |
 | `scheduled_calibrate.py` | Continuous scheduled capture with CSV logging (for tuning thresholds) |
 | `run_capture.py` | Single-frame capture for use with Windows Task Scheduler |
-| `test_harness.py` | Validates all calibration images against current references and threshold |
+| `test_harness.py` | Validates all calibration images against current references and thresholds |
+| `validate_detection.py` | Runs the 3-signal detection pipeline on all images and produces a CSV report |
 | `refimage/` | Reference images of the closed garage door |
 | `images/` | Captured frames from the monitor (auto-cleaned, keeps last 30) |
 | `calibration_images/` | Captured frames from calibration runs |
