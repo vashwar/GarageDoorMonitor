@@ -14,6 +14,19 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # =============================================================================
 load_dotenv()
 
+# Bound how long a single open/read may block, in milliseconds.
+CAPTURE_OPEN_TIMEOUT_MS = int(os.getenv("CAPTURE_OPEN_TIMEOUT_MS", "8000"))
+CAPTURE_READ_TIMEOUT_MS = int(os.getenv("CAPTURE_READ_TIMEOUT_MS", "8000"))
+CAPTURE_RETRIES = int(os.getenv("CAPTURE_RETRIES", "3"))
+CAPTURE_RETRY_BACKOFF = int(os.getenv("CAPTURE_RETRY_BACKOFF", "5"))
+
+# Force RTSP over TCP before any VideoCapture is created. OpenCV reads this env
+# var when the ffmpeg backend opens the stream. TCP is far more stable than the
+# ffmpeg UDP default, which stalls and triggers read timeouts on Tapo. The
+# open/read timeouts themselves are bounded via constructor params in
+# _open_capture() (they must be set before the connect starts).
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
 RTSP_URL = os.getenv("RTSP_URL")
 SSIM_THRESHOLD = float(os.getenv("SSIM_THRESHOLD", "0.55"))
 REFERENCE_IMAGES = os.getenv("REFERENCE_IMAGES", "").split(",")
@@ -22,6 +35,7 @@ TELEGRAM_CHAT_IDS = [
     int(cid.strip()) for cid in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if cid.strip()
 ]
 OPEN_ALERT_MINUTES = int(os.getenv("OPEN_ALERT_MINUTES", "5"))
+REPEAT_ALERT_MINUTES = int(os.getenv("REPEAT_ALERT_MINUTES", "15"))
 
 # How often to check (seconds) — reads INTERVAL_MINUTES from .env
 MONITOR_INTERVAL = int(os.getenv("INTERVAL_MINUTES", "15")) * 60
@@ -86,23 +100,59 @@ def load_references(paths):
     return refs
 
 
+def _open_capture():
+    """Open the RTSP stream over TCP with bounded open/read timeouts.
+
+    The timeouts must be passed as constructor params: OpenCV's ffmpeg
+    interrupt callback reads them before the connect starts, so a dead camera
+    fails in ~CAPTURE_OPEN_TIMEOUT_MS instead of the 30s default. Setting them
+    via cap.set() after construction is too late — the connect already ran.
+    """
+    params = [
+        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, CAPTURE_OPEN_TIMEOUT_MS,
+        cv2.CAP_PROP_READ_TIMEOUT_MSEC, CAPTURE_READ_TIMEOUT_MS,
+    ]
+    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG, params)
+    # Keep the buffer shallow so we read the latest frame, not a stale backlog.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
 def capture_frame_from_camera():
-    """Connect to camera, grab a single frame, return (color, grayscale) or (None, None)."""
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        return None, None
+    """Connect to camera, grab a single frame, return (color, grayscale) or (None, None).
 
-    for _ in range(WARMUP_FRAMES):
-        cap.read()
+    Retries a few times with short backoff on transient RTSP failures so a
+    single dropped connection doesn't blind the monitor for a full interval.
+    """
+    for attempt in range(1, CAPTURE_RETRIES + 1):
+        cap = _open_capture()
+        try:
+            if not cap.isOpened():
+                raise RuntimeError("stream did not open")
 
-    ret, frame = cap.read()
-    cap.release()
+            # Warm up with cheap grab() calls so auto-exposure settles without
+            # decoding every frame (and without stacking read timeouts).
+            for _ in range(WARMUP_FRAMES):
+                if not cap.grab():
+                    raise RuntimeError("grab failed during warmup")
 
-    if not ret or frame is None:
-        return None, None
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                raise RuntimeError("read returned no frame")
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return frame, gray
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return frame, gray
+        except Exception as e:
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [WARN] capture attempt "
+                f"{attempt}/{CAPTURE_RETRIES} failed: {e}"
+            )
+            if attempt < CAPTURE_RETRIES:
+                time.sleep(CAPTURE_RETRY_BACKOFF)
+        finally:
+            cap.release()
+
+    return None, None
 
 
 def compute_ssim(frame, reference):
@@ -284,7 +334,7 @@ async def monitor_loop(app: Application):
     bot = app.bot
 
     door_open_since = None
-    alert_sent = False
+    last_alert_time = None
     consecutive_open_count = 0
 
     # Wait for bot to be ready
@@ -294,6 +344,7 @@ async def monitor_loop(app: Application):
     print(f"Laplacian threshold: {LAPLACIAN_THRESHOLD}")
     print(f"Consecutive OPEN readings required: {CONSECUTIVE_OPEN_REQUIRED}")
     print(f"Alert after {OPEN_ALERT_MINUTES} minutes open.")
+    print(f"Repeat alert every {REPEAT_ALERT_MINUTES} minutes if still open.")
     print("-" * 70)
 
     while True:
@@ -334,28 +385,37 @@ async def monitor_loop(app: Application):
             if confirmed_open:
                 if door_open_since is None:
                     door_open_since = datetime.now()
-                    alert_sent = False
+                    last_alert_time = None
 
-                elapsed = (datetime.now() - door_open_since).total_seconds() / 60
+                elapsed_total = (datetime.now() - door_open_since).total_seconds() / 60
 
-                if elapsed >= OPEN_ALERT_MINUTES and not alert_sent:
-                    alert_path = await asyncio.to_thread(
-                        save_image, color_frame, "alert"
-                    )
-                    alert_msg = (
-                        f"ALERT: Garage door has been OPEN for "
-                        f"{int(elapsed)} minutes!\n"
-                        f"SSIM: {best_ssim:.4f} ({signals['ssim_vote']})\n"
-                        f"LapVar: {signals['laplacian_var']:.0f} ({signals['lap_vote']})\n"
-                        f"Bright: {signals['mean_brightness']:.0f} ({signals['bright_vote']}, {signals['camera_mode']})\n"
-                        f"Votes: {signals['open_votes']}/3 OPEN\n"
-                        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-                    await send_alert(bot, alert_msg, alert_path)
-                    alert_sent = True
-                    print(f"[{timestamp}] *** ALERT SENT ***")
+                if elapsed_total >= OPEN_ALERT_MINUTES:
+                    send_alert_now = False
+                    if last_alert_time is None:
+                        send_alert_now = True
+                    else:
+                        elapsed_since_last = (datetime.now() - last_alert_time).total_seconds() / 60
+                        if elapsed_since_last >= REPEAT_ALERT_MINUTES:
+                            send_alert_now = True
+
+                    if send_alert_now:
+                        alert_path = await asyncio.to_thread(
+                            save_image, color_frame, "alert"
+                        )
+                        alert_msg = (
+                            f"ALERT: Garage door has been OPEN for "
+                            f"{int(elapsed_total)} minutes!\n"
+                            f"SSIM: {best_ssim:.4f} ({signals['ssim_vote']})\n"
+                            f"LapVar: {signals['laplacian_var']:.0f} ({signals['lap_vote']})\n"
+                            f"Bright: {signals['mean_brightness']:.0f} ({signals['bright_vote']}, {signals['camera_mode']})\n"
+                            f"Votes: {signals['open_votes']}/3 OPEN\n"
+                            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                        await send_alert(bot, alert_msg, alert_path)
+                        last_alert_time = datetime.now()
+                        print(f"[{timestamp}] *** ALERT SENT ***")
             else:
-                if door_open_since is not None and alert_sent:
+                if door_open_since is not None and last_alert_time is not None:
                     elapsed = (datetime.now() - door_open_since).total_seconds() / 60
                     clear_msg = (
                         f"Garage door is now CLOSED.\n"
@@ -365,7 +425,7 @@ async def monitor_loop(app: Application):
                     print(f"[{timestamp}] *** ALL-CLEAR SENT ***")
 
                 door_open_since = None
-                alert_sent = False
+                last_alert_time = None
 
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] Monitor error: {e}")
