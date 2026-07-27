@@ -66,7 +66,7 @@ git clone https://github.com/vashwar/GarageDoorMonitor.git
 cd GarageDoorMonitor
 
 # Step 2: Install dependencies
-pip install opencv-python scikit-image python-telegram-bot python-dotenv
+pip install -r requirements.txt
 
 # Step 3: Set up environment variables
 # Create a .env file in the project root (see Environment Variables below)
@@ -158,6 +158,7 @@ Was open for 6 minutes.
 
 | File | Purpose |
 |------|---------|
+| `requirements.txt` | Python dependencies, with pinned versions |
 | `garage_monitor.py` | Main monitor -- runs continuously, sends Telegram alerts |
 | `capture_reference.py` | Interactive tool to capture new reference images from the camera |
 | `calibrate.py` | One-time calibration -- captures a frame and shows SSIM scores against all references |

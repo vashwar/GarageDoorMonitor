@@ -1,0 +1,28 @@
+# Garage Door Vision Monitor -- Python dependencies
+# Requires Python 3.10 or newer (developed on 3.11).
+#
+# Install with:  pip install -r requirements.txt
+#
+# Versions are pinned exactly so the monitor keeps behaving the same way over
+# time -- this runs unattended for weeks, and a surprise upgrade breaking the
+# door detection is a lot worse than missing out on a new release. To pick up
+# newer versions deliberately, relax a pin to >= and re-run the validation
+# scripts (test_harness.py, validate_detection.py) against your reference
+# images before trusting it.
+
+# Frame capture from the Tapo RTSP stream
+opencv-python==4.13.0.92
+
+# SSIM (structural similarity) scoring against the reference images
+scikit-image==0.26.0
+
+# Telegram bot -- alerts and the /status command (v20+ async API)
+python-telegram-bot==22.7
+
+# Loads configuration from the .env file
+python-dotenv==1.0.1
+
+# numpy is deliberately left unpinned. It is not imported directly -- it comes
+# in through opencv-python and scikit-image, and opencv-python 4.13 requires
+# numpy>=2 on Python 3.9+. Pinning it here only creates conflicts; let pip
+# resolve a set that satisfies both.
