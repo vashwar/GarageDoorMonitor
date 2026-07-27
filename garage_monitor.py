@@ -328,6 +328,22 @@ async def send_alert(bot, message, photo_path=None):
 # Monitoring Loop
 # =============================================================================
 
+def next_sleep_seconds(door_is_open):
+    """Seconds to wait before the next check.
+
+    The bottom-of-loop sleep is what actually gates alert frequency: a repeat
+    alert can only fire on an iteration where the loop is awake, so polling
+    every MONITOR_INTERVAL makes a shorter REPEAT_ALERT_MINUTES unreachable
+    (a 30-min poll turns a 5-min repeat setting into a 30-min one). While the
+    door is open, poll at the reminder cadence instead; fall back to the
+    slower idle interval once it closes so we aren't hammering the camera
+    around the clock. The floor keeps a misconfigured 0 from spinning.
+    """
+    if door_is_open:
+        return max(60, min(REPEAT_ALERT_MINUTES * 60, MONITOR_INTERVAL))
+    return MONITOR_INTERVAL
+
+
 async def monitor_loop(app: Application):
     """Continuous monitoring loop that sends alerts when door is open too long."""
     references = app.bot_data["references"]
@@ -339,7 +355,10 @@ async def monitor_loop(app: Application):
 
     # Wait for bot to be ready
     await asyncio.sleep(2)
-    print(f"Monitoring started. Checking every {MONITOR_INTERVAL // 60} minutes.")
+    print(
+        f"Monitoring started. Checking every {MONITOR_INTERVAL // 60} minutes "
+        f"while closed, every {next_sleep_seconds(True) // 60} while open."
+    )
     print(f"SSIM threshold: {SSIM_THRESHOLD}")
     print(f"Laplacian threshold: {LAPLACIAN_THRESHOLD}")
     print(f"Consecutive OPEN readings required: {CONSECUTIVE_OPEN_REQUIRED}")
@@ -352,7 +371,9 @@ async def monitor_loop(app: Application):
             color_frame, gray_frame = await asyncio.to_thread(capture_frame_from_camera)
             if gray_frame is None:
                 print(f"[{time.strftime('%H:%M:%S')}] [WARN] Failed to capture frame")
-                await asyncio.sleep(MONITOR_INTERVAL)
+                # Keep the fast cadence through a dropped capture so a blind
+                # spell mid-episode doesn't stretch the reminder gap.
+                await asyncio.sleep(next_sleep_seconds(door_open_since is not None))
                 continue
 
             is_open, best_ssim, best_ref, signals = await asyncio.to_thread(
@@ -430,7 +451,7 @@ async def monitor_loop(app: Application):
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] Monitor error: {e}")
 
-        await asyncio.sleep(MONITOR_INTERVAL)
+        await asyncio.sleep(next_sleep_seconds(door_open_since is not None))
 
 
 # =============================================================================
