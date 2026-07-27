@@ -4,7 +4,8 @@ A Python-based system that watches your garage door using a TP-Link Tapo securit
 
 ## Key Features
 
-- **Automatic monitoring** -- continuously checks your garage door at a configurable interval (default: 30 minutes)
+- **Automatic monitoring** -- checks your garage door on a schedule that adapts to what it sees: a slow interval while the door is closed, and a faster one while it is open
+- **Recurring reminders** -- keeps reminding you every few minutes for as long as the door stays open, not just once
 - **Multi-signal detection** -- uses three independent signals (image similarity, texture complexity, brightness) with 2-of-3 voting for robust classification
 - **Multi-reference matching** -- compares against multiple reference images (two cars, one car, no cars, day/night) to handle different garage configurations
 - **Telegram alerts** -- sends a photo and message to your phone when the door is open, and an all-clear when it closes
@@ -36,6 +37,20 @@ If **2 or more signals** vote OPEN, the door is classified as open.
 
 When the door is confirmed open, a Telegram alert with a photo is sent. When it closes again, an all-clear message is sent.
 
+## Alert Timing
+
+The monitor changes how often it looks at the camera based on what it last saw:
+
+| State | How often it checks | What happens |
+|-------|--------------------|--------------|
+| Door closed | every `INTERVAL_MINUTES` (default: 15) | quiet, just watching |
+| Door open | every `REPEAT_ALERT_MINUTES` (default: 15) | alerts, then reminds you at that same interval |
+| Door closes again | back to `INTERVAL_MINUTES` | sends the all-clear, returns to slow checking |
+
+This matters because **a reminder can only be sent on a check.** If the monitor only looked at the camera every 30 minutes, asking for a 5-minute reminder would still get you one every 30 minutes -- there is nothing running in between to send it. Dropping to the reminder interval while the door is open is what makes the shorter setting actually work.
+
+The trade-off to know about: because checks are spaced `INTERVAL_MINUTES` apart while the door is closed, the door can already be open for up to that long before the first alert arrives. If you want to hear about it faster, lower `INTERVAL_MINUTES` -- at the cost of contacting the camera more often all day.
+
 ## Prerequisites
 
 - Python 3.10+ ([download](https://www.python.org/downloads/))
@@ -46,8 +61,9 @@ When the door is confirmed open, a Telegram alert with a photo is sent. When it 
 ## Installation
 
 ```bash
-# Step 1: Clone or download the project
-cd C:\VashwarTests\GarageCamera
+# Step 1: Clone the project and enter the folder
+git clone https://github.com/vashwar/GarageDoorMonitor.git
+cd GarageDoorMonitor
 
 # Step 2: Install dependencies
 pip install opencv-python scikit-image python-telegram-bot python-dotenv
@@ -55,6 +71,8 @@ pip install opencv-python scikit-image python-telegram-bot python-dotenv
 # Step 3: Set up environment variables
 # Create a .env file in the project root (see Environment Variables below)
 ```
+
+> **Note:** `.env` holds your camera password and bot token, and is listed in `.gitignore` so it is never committed. Never share it or paste its contents anywhere.
 
 ## Environment Variables
 
@@ -67,13 +85,25 @@ Create a `.env` file in the project root:
 | `TELEGRAM_CHAT_IDS` | Comma-separated Telegram chat IDs to receive alerts | Yes |
 | `REFERENCE_IMAGES` | Comma-separated paths to reference images | Yes |
 | `SSIM_THRESHOLD` | Similarity threshold (0-1). Below this = door open | No (default: 0.55) |
-| `INTERVAL_MINUTES` | How often to check, in minutes | No (default: 30) |
-| `OPEN_ALERT_MINUTES` | Minutes door must stay open before alerting | No (default: 5) |
+| `INTERVAL_MINUTES` | How often to check **while the door is closed** | No (default: 15) |
+| `OPEN_ALERT_MINUTES` | Minutes door must stay open before the first alert. `0` = alert as soon as it is seen open | No (default: 5) |
+| `REPEAT_ALERT_MINUTES` | How often to re-send the reminder while the door stays open. Also becomes the check interval while open | No (default: 15) |
 | `LAPLACIAN_THRESHOLD` | Texture complexity threshold. Above this = door open | No (default: 700) |
 | `BRIGHTNESS_IR_OPEN_MAX` | IR mode brightness below this = door open | No (default: 85) |
 | `BRIGHTNESS_DAY_OPEN_MIN` | Daylight brightness above this = door open | No (default: 165) |
-| `CONSECUTIVE_OPEN_REQUIRED` | Number of consecutive OPEN readings before confirming | No (default: 2) |
+| `CONSECUTIVE_OPEN_REQUIRED` | How many checks in a row must say OPEN before alerting. `1` = alert on the first one; `2` = ignore a single odd frame. Values below 1 are raised to 1 | No (default: 2) |
 | `ROI_STD_THRESHOLD` | Low ROI standard deviation override threshold | No (default: 55) |
+
+### Camera connection settings
+
+You will not normally need to change these. They bound how long the monitor waits on a slow or unreachable camera before giving up, so one bad connection cannot stall it.
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `CAPTURE_OPEN_TIMEOUT_MS` | Milliseconds to wait for the video stream to open | No (default: 8000) |
+| `CAPTURE_READ_TIMEOUT_MS` | Milliseconds to wait for a frame to arrive | No (default: 8000) |
+| `CAPTURE_RETRIES` | How many times to retry a failed capture | No (default: 3) |
+| `CAPTURE_RETRY_BACKOFF` | Seconds to wait between retries | No (default: 5) |
 
 ## How to Run
 
@@ -149,3 +179,17 @@ If the monitor produces false positives (classifying a closed door as open), you
 3. Restart the monitor
 
 Common scenarios that need their own reference: daytime vs nighttime (IR mode), different car configurations, seasonal lighting changes.
+
+## Troubleshooting
+
+**Only run one copy at a time.** Telegram allows a single program to listen for a bot's messages. If a second copy starts, both will fail with `Conflict: terminated by other getUpdates request`. On Windows, check with `tasklist | findstr python` and stop any strays with `stop_monitor.bat`.
+
+**Reminders arriving less often than expected.** A reminder can only be sent when the monitor wakes up to check. Make sure `REPEAT_ALERT_MINUTES` is not larger than you intend -- while the door is open, it sets both the reminder gap and the checking interval.
+
+**Alerts for a door that is closed.** Add a reference image for that lighting condition (see above), or set `CONSECUTIVE_OPEN_REQUIRED=2` so a single odd frame cannot trigger an alert on its own.
+
+**No alerts at all.** Confirm the monitor is actually running -- if it was started with `start_monitor.bat` it runs invisibly in the background with no window. Send `status` to the bot on Telegram; if there is no reply, it is not running.
+
+## License
+
+No license file is included, so all rights are reserved by default. Add a `LICENSE` file if you intend to share this publicly.

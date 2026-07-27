@@ -56,7 +56,12 @@ LAPLACIAN_THRESHOLD = float(os.getenv("LAPLACIAN_THRESHOLD", "700"))
 BRIGHTNESS_IR_OPEN_MAX = float(os.getenv("BRIGHTNESS_IR_OPEN_MAX", "85"))
 BRIGHTNESS_DAY_OPEN_MIN = float(os.getenv("BRIGHTNESS_DAY_OPEN_MIN", "165"))
 IR_SATURATION_THRESHOLD = 20.0
-CONSECUTIVE_OPEN_REQUIRED = int(os.getenv("CONSECUTIVE_OPEN_REQUIRED", "2"))
+# Clamped to at least 1: the counter resets to 0 on a CLOSED reading, so a
+# threshold of 0 is unmissable (0 >= 0) and every check would confirm OPEN
+# regardless of what the camera saw — silently disabling the whole detection
+# pipeline and alerting forever. 1 alerts on the first open reading; 2 requires
+# two in a row, which is the fix if a stray frame ever causes a false alarm.
+CONSECUTIVE_OPEN_REQUIRED = max(1, int(os.getenv("CONSECUTIVE_OPEN_REQUIRED", "2")))
 ROI_STD_THRESHOLD = float(os.getenv("ROI_STD_THRESHOLD", "55"))
 
 
