@@ -2,7 +2,11 @@ import cv2
 import sys
 import os
 import asyncio
+import re
+import socket
+import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from dotenv import load_dotenv
 from skimage.metrics import structural_similarity as ssim
@@ -28,6 +32,17 @@ CAPTURE_RETRY_BACKOFF = int(os.getenv("CAPTURE_RETRY_BACKOFF", "5"))
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 RTSP_URL = os.getenv("RTSP_URL")
+
+# Camera identity that survives a DHCP lease change. The IP inside RTSP_URL is
+# only a hint: this camera publishes no DNS, NetBIOS or mDNS name, so there is
+# nothing to resolve it by except its MAC (stable) or the fact that it is the
+# host on this LAN answering on the RTSP port. Set CAMERA_MAC to disambiguate
+# when more than one device answers.
+CAMERA_MAC = os.getenv("CAMERA_MAC", "").strip()
+CAMERA_DISCOVERY = os.getenv("CAMERA_DISCOVERY", "1").lower() not in ("0", "false", "no")
+CAMERA_HOST_CACHE = os.getenv("CAMERA_HOST_CACHE", ".camera_host")
+DISCOVERY_PORT_TIMEOUT = float(os.getenv("DISCOVERY_PORT_TIMEOUT", "0.4"))
+
 SSIM_THRESHOLD = float(os.getenv("SSIM_THRESHOLD", "0.55"))
 REFERENCE_IMAGES = os.getenv("REFERENCE_IMAGES", "").split(",")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -105,7 +120,171 @@ def load_references(paths):
     return refs
 
 
-def _open_capture():
+# =============================================================================
+# Camera address resolution
+#
+# The camera's IP is assigned by DHCP and moves without warning, which silently
+# blinds the monitor until someone notices the alerts stopped. Rather than
+# trusting the IP baked into RTSP_URL, resolve the camera each time we need it
+# and remember what worked.
+# =============================================================================
+
+def _log(level, message):
+    print(f"[{time.strftime('%H:%M:%S')}] [{level}] {message}")
+
+
+def _split_rtsp_url(url):
+    """Split an RTSP URL into (prefix, host, port, suffix).
+
+    The authority is split on the LAST '@', matching ffmpeg's av_url_split. Our
+    password itself contains an '@', so splitting on the first one would tear
+    the credential in half and hand the tail to the resolver as a hostname.
+    """
+    scheme, _, rest = url.partition("://")
+    authority, slash, path = rest.partition("/")
+    userinfo, at, hostport = authority.rpartition("@")
+    # Host may be bracketed (an IPv6 convention that also parses for IPv4).
+    match = re.match(r"^(\[[^\]]*\]|[^:]*)(?::(\d+))?$", hostport)
+    host = match.group(1).strip("[]") if match else hostport
+    port = int(match.group(2)) if match and match.group(2) else 554
+    return f"{scheme}://{userinfo}{at}", host, port, f"{slash}{path}"
+
+
+def _build_rtsp_url(prefix, host, port, suffix):
+    return f"{prefix}{host}:{port}{suffix}"
+
+
+def _normalize_mac(mac):
+    return re.sub(r"[^0-9a-f]", "", mac.lower())
+
+
+def _port_open(host, port, timeout=None):
+    """True if a TCP connection to host:port completes."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout or DISCOVERY_PORT_TIMEOUT):
+            return True
+    except OSError:
+        return False
+
+
+def _arp_table():
+    """Map normalized MAC -> IP from the OS ARP cache. Empty on any failure."""
+    try:
+        output = subprocess.run(
+            ["arp", "-a"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+    table = {}
+    for line in output.splitlines():
+        found = re.search(
+            r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})", line
+        )
+        if found:
+            table[_normalize_mac(found.group(2))] = found.group(1)
+    return table
+
+
+def _scan_subnet(reference_host, port):
+    """Return every host on reference_host's /24 answering on `port`.
+
+    Also primes the ARP cache as a side effect, which is what makes the
+    subsequent MAC match possible when the camera has aged out of the table.
+    """
+    octets = reference_host.split(".")
+    if len(octets) != 4:
+        return []
+    prefix = ".".join(octets[:3])
+    hosts = [f"{prefix}.{i}" for i in range(1, 255)]
+    with ThreadPoolExecutor(max_workers=128) as pool:
+        results = pool.map(lambda h: _port_open(h, port), hosts)
+        return [host for host, is_open in zip(hosts, results) if is_open]
+
+
+def _read_cached_host():
+    try:
+        with open(CAMERA_HOST_CACHE) as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _write_cached_host(host):
+    try:
+        with open(CAMERA_HOST_CACHE, "w") as handle:
+            handle.write(host)
+    except OSError as e:
+        _log("WARN", f"could not cache camera host: {e}")
+
+
+def invalidate_camera_host():
+    """Forget the cached address so the next resolve rediscovers from scratch."""
+    try:
+        os.remove(CAMERA_HOST_CACHE)
+    except OSError:
+        pass
+
+
+def resolve_rtsp_url():
+    """Return RTSP_URL pointed at wherever the camera actually is right now.
+
+    Tries, in order: the cached address, the address configured in RTSP_URL,
+    the MAC in the ARP cache, then a sweep of the local /24 for the RTSP port.
+    Falls back to the configured URL unchanged so behaviour is never worse than
+    before discovery existed.
+    """
+    prefix, configured_host, port, suffix = _split_rtsp_url(RTSP_URL)
+
+    if not CAMERA_DISCOVERY:
+        return _build_rtsp_url(prefix, configured_host, port, suffix)
+
+    wanted_mac = _normalize_mac(CAMERA_MAC) if CAMERA_MAC else None
+
+    # Known-good addresses first: the common case is nothing moved at all.
+    for host in (_read_cached_host(), configured_host):
+        if host and _port_open(host, port):
+            if host != configured_host:
+                _log("INFO", f"camera at {host} (configured: {configured_host})")
+            return _build_rtsp_url(prefix, host, port, suffix)
+
+    if wanted_mac:
+        cached_ip = _arp_table().get(wanted_mac)
+        if cached_ip and _port_open(cached_ip, port):
+            _log("INFO", f"camera moved to {cached_ip} (matched MAC {CAMERA_MAC})")
+            _write_cached_host(cached_ip)
+            return _build_rtsp_url(prefix, cached_ip, port, suffix)
+
+    _log("INFO", f"camera not at {configured_host}; scanning local subnet")
+    candidates = _scan_subnet(configured_host, port)
+
+    if wanted_mac:
+        arp = _arp_table()
+        matched = [host for host in candidates if arp.get(wanted_mac) == host]
+        if matched:
+            candidates = matched
+
+    if len(candidates) == 1:
+        host = candidates[0]
+        _log("INFO", f"camera found at {host}")
+        _write_cached_host(host)
+        return _build_rtsp_url(prefix, host, port, suffix)
+
+    if len(candidates) > 1:
+        # Guessing here could point the monitor at a neighbouring camera and
+        # report the wrong door, so refuse and say what we saw.
+        _log(
+            "WARN",
+            f"multiple hosts answer on port {port}: {', '.join(candidates)}. "
+            "Set CAMERA_MAC in .env to identify the garage camera.",
+        )
+    else:
+        _log("WARN", f"no host on this subnet answers on port {port}")
+
+    return _build_rtsp_url(prefix, configured_host, port, suffix)
+
+
+def _open_capture(url):
     """Open the RTSP stream over TCP with bounded open/read timeouts.
 
     The timeouts must be passed as constructor params: OpenCV's ffmpeg
@@ -117,7 +296,7 @@ def _open_capture():
         cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, CAPTURE_OPEN_TIMEOUT_MS,
         cv2.CAP_PROP_READ_TIMEOUT_MSEC, CAPTURE_READ_TIMEOUT_MS,
     ]
-    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG, params)
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
     # Keep the buffer shallow so we read the latest frame, not a stale backlog.
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
@@ -129,8 +308,10 @@ def capture_frame_from_camera():
     Retries a few times with short backoff on transient RTSP failures so a
     single dropped connection doesn't blind the monitor for a full interval.
     """
+    url = resolve_rtsp_url()
+
     for attempt in range(1, CAPTURE_RETRIES + 1):
-        cap = _open_capture()
+        cap = _open_capture(url)
         try:
             if not cap.isOpened():
                 raise RuntimeError("stream did not open")
@@ -157,6 +338,9 @@ def capture_frame_from_camera():
         finally:
             cap.release()
 
+    # Every attempt failed against this address. Drop it so the next cycle
+    # re-resolves instead of retrying a stale IP forever.
+    invalidate_camera_host()
     return None, None
 
 

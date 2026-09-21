@@ -53,6 +53,9 @@ SamplePython.py
 calibrate.py
 capture_reference.py
 
+# Last-known-good camera IP, rediscovered automatically (machine-local)
+.camera_host
+
 # Captured images and calibration data (large, local-only)
 images/
 calibration_images/
